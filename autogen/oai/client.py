@@ -49,6 +49,41 @@ try:
 except ImportError as e:
     gemini_import_exception = e
 
+try:
+    from autogen.oai.anthropic import AnthropicClient
+
+    anthropic_import_exception: Optional[ImportError] = None
+except ImportError as e:
+    anthropic_import_exception = e
+
+try:
+    from autogen.oai.mistral import MistralAIClient
+
+    mistral_import_exception: Optional[ImportError] = None
+except ImportError as e:
+    mistral_import_exception = e
+
+try:
+    from autogen.oai.together import TogetherClient
+
+    together_import_exception: Optional[ImportError] = None
+except ImportError as e:
+    together_import_exception = e
+
+try:
+    from autogen.oai.groq import GroqClient
+
+    groq_import_exception: Optional[ImportError] = None
+except ImportError as e:
+    groq_import_exception = e
+
+try:
+    from autogen.oai.cohere import CohereClient
+
+    cohere_import_exception: Optional[ImportError] = None
+except ImportError as e:
+    cohere_import_exception = e
+
 logger = logging.getLogger(__name__)
 if not logger.handlers:
     # Add the console handler.
@@ -448,6 +483,31 @@ class OpenAIWrapper:
                 if gemini_import_exception:
                     raise ImportError("Please install `google-generativeai` to use Google OpenAI API.")
                 client = GeminiClient(**openai_config)
+                self._clients.append(client)
+            elif api_type is not None and api_type.startswith("anthropic"):
+                if anthropic_import_exception:
+                    raise ImportError("Please install `anthropic` to use Anthropic API.")
+                client = AnthropicClient(**openai_config)
+                self._clients.append(client)
+            elif api_type is not None and api_type.startswith("mistral"):
+                if mistral_import_exception:
+                    raise ImportError("Please install `mistralai` to use the Mistral.AI API.")
+                client = MistralAIClient(**openai_config)
+                self._clients.append(client)
+            elif api_type is not None and api_type.startswith("together"):
+                if together_import_exception:
+                    raise ImportError("Please install `together` to use the Together.AI API.")
+                client = TogetherClient(**openai_config)
+                self._clients.append(client)
+            elif api_type is not None and api_type.startswith("groq"):
+                if groq_import_exception:
+                    raise ImportError("Please install `groq` to use the Groq API.")
+                client = GroqClient(**openai_config)
+                self._clients.append(client)
+            elif api_type is not None and api_type.startswith("cohere"):
+                if cohere_import_exception:
+                    raise ImportError("Please install `cohere` to use the Groq API.")
+                client = CohereClient(**openai_config)
                 self._clients.append(client)
             else:
                 client = OpenAI(**openai_config)
