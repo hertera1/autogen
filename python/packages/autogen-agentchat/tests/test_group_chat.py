@@ -7,25 +7,30 @@ from typing import Any, AsyncGenerator, List, Sequence
 import pytest
 from autogen_agentchat import EVENT_LOGGER_NAME
 from autogen_agentchat.agents import (
+    AssistantAgent,
     BaseChatAgent,
-    ChatMessage,
     CodeExecutorAgent,
-    CodingAssistantAgent,
-    StopMessage,
-    TextMessage,
-    ToolUseAssistantAgent,
+    Handoff,
 )
 from autogen_agentchat.logging import FileLogHandler
+from autogen_agentchat.messages import (
+    ChatMessage,
+    HandoffMessage,
+    StopMessage,
+    TextMessage,
+)
+from autogen_agentchat.task import MaxMessageTermination, StopMessageTermination
 from autogen_agentchat.teams import (
     RoundRobinGroupChat,
     SelectorGroupChat,
-    StopMessageTermination,
+    Swarm,
 )
 from autogen_core.base import CancellationToken
 from autogen_core.components import FunctionCall
 from autogen_core.components.code_executor import LocalCommandLineCodeExecutor
-from autogen_core.components.models import FunctionExecutionResult, OpenAIChatCompletionClient
+from autogen_core.components.models import FunctionExecutionResult
 from autogen_core.components.tools import FunctionTool
+from autogen_ext.models import OpenAIChatCompletionClient
 from openai.resources.chat.completions import AsyncCompletions
 from openai.types.chat.chat_completion import ChatCompletion, Choice
 from openai.types.chat.chat_completion_chunk import ChatCompletionChunk
@@ -126,7 +131,7 @@ async def test_round_robin_group_chat(monkeypatch: pytest.MonkeyPatch) -> None:
         code_executor_agent = CodeExecutorAgent(
             "code_executor", code_executor=LocalCommandLineCodeExecutor(work_dir=temp_dir)
         )
-        coding_assistant_agent = CodingAssistantAgent(
+        coding_assistant_agent = AssistantAgent(
             "coding_assistant", model_client=OpenAIChatCompletionClient(model=model, api_key="")
         )
         team = RoundRobinGroupChat(participants=[coding_assistant_agent, code_executor_agent])
@@ -206,14 +211,23 @@ async def test_round_robin_group_chat_with_tools(monkeypatch: pytest.MonkeyPatch
     mock = _MockChatCompletion(chat_completions)
     monkeypatch.setattr(AsyncCompletions, "create", mock.mock_create)
     tool = FunctionTool(_pass_function, name="pass", description="pass function")
-    tool_use_agent = ToolUseAssistantAgent(
+    tool_use_agent = AssistantAgent(
         "tool_use_agent",
         model_client=OpenAIChatCompletionClient(model=model, api_key=""),
-        registered_tools=[tool],
+        tools=[tool],
     )
     echo_agent = _EchoAgent("echo_agent", description="echo agent")
     team = RoundRobinGroupChat(participants=[tool_use_agent, echo_agent])
-    await team.run("Write a program that prints 'Hello, world!'", termination_condition=StopMessageTermination())
+    result = await team.run(
+        "Write a program that prints 'Hello, world!'", termination_condition=StopMessageTermination()
+    )
+
+    assert len(result.messages) == 4
+    assert isinstance(result.messages[0], TextMessage)  # task
+    assert isinstance(result.messages[1], TextMessage)  # tool use agent response
+    assert isinstance(result.messages[2], TextMessage)  # echo agent response
+    assert isinstance(result.messages[3], StopMessage)  # tool use agent response
+
     context = tool_use_agent._model_context  # pyright: ignore
     assert context[0].content == "Write a program that prints 'Hello, world!'"
     assert isinstance(context[1].content, list)
@@ -394,3 +408,102 @@ async def test_selector_group_chat_two_speakers_allow_repeated(monkeypatch: pyte
     assert result.messages[1].source == "agent2"
     assert result.messages[2].source == "agent2"
     assert result.messages[3].source == "agent1"
+
+
+class _HandOffAgent(BaseChatAgent):
+    def __init__(self, name: str, description: str, next_agent: str) -> None:
+        super().__init__(name, description)
+        self._next_agent = next_agent
+
+    async def on_messages(self, messages: Sequence[ChatMessage], cancellation_token: CancellationToken) -> ChatMessage:
+        return HandoffMessage(content=f"Transferred to {self._next_agent}.", target=self._next_agent, source=self.name)
+
+
+@pytest.mark.asyncio
+async def test_swarm_handoff() -> None:
+    first_agent = _HandOffAgent("first_agent", description="first agent", next_agent="second_agent")
+    second_agent = _HandOffAgent("second_agent", description="second agent", next_agent="third_agent")
+    third_agent = _HandOffAgent("third_agent", description="third agent", next_agent="first_agent")
+
+    team = Swarm([second_agent, first_agent, third_agent])
+    result = await team.run("task", termination_condition=MaxMessageTermination(6))
+    assert len(result.messages) == 6
+    assert result.messages[0].content == "task"
+    assert result.messages[1].content == "Transferred to third_agent."
+    assert result.messages[2].content == "Transferred to first_agent."
+    assert result.messages[3].content == "Transferred to second_agent."
+    assert result.messages[4].content == "Transferred to third_agent."
+    assert result.messages[5].content == "Transferred to first_agent."
+
+
+@pytest.mark.asyncio
+async def test_swarm_handoff_using_tool_calls(monkeypatch: pytest.MonkeyPatch) -> None:
+    model = "gpt-4o-2024-05-13"
+    chat_completions = [
+        ChatCompletion(
+            id="id1",
+            choices=[
+                Choice(
+                    finish_reason="tool_calls",
+                    index=0,
+                    message=ChatCompletionMessage(
+                        content=None,
+                        tool_calls=[
+                            ChatCompletionMessageToolCall(
+                                id="1",
+                                type="function",
+                                function=Function(
+                                    name="handoff_to_agent2",
+                                    arguments=json.dumps({}),
+                                ),
+                            )
+                        ],
+                        role="assistant",
+                    ),
+                )
+            ],
+            created=0,
+            model=model,
+            object="chat.completion",
+            usage=CompletionUsage(prompt_tokens=0, completion_tokens=0, total_tokens=0),
+        ),
+        ChatCompletion(
+            id="id2",
+            choices=[
+                Choice(finish_reason="stop", index=0, message=ChatCompletionMessage(content="Hello", role="assistant"))
+            ],
+            created=0,
+            model=model,
+            object="chat.completion",
+            usage=CompletionUsage(prompt_tokens=0, completion_tokens=0, total_tokens=0),
+        ),
+        ChatCompletion(
+            id="id2",
+            choices=[
+                Choice(
+                    finish_reason="stop", index=0, message=ChatCompletionMessage(content="TERMINATE", role="assistant")
+                )
+            ],
+            created=0,
+            model=model,
+            object="chat.completion",
+            usage=CompletionUsage(prompt_tokens=0, completion_tokens=0, total_tokens=0),
+        ),
+    ]
+    mock = _MockChatCompletion(chat_completions)
+    monkeypatch.setattr(AsyncCompletions, "create", mock.mock_create)
+
+    agnet1 = AssistantAgent(
+        "agent1",
+        model_client=OpenAIChatCompletionClient(model=model, api_key=""),
+        handoffs=[Handoff(target="agent2", name="handoff_to_agent2", message="handoff to agent2")],
+    )
+    agent2 = _HandOffAgent("agent2", description="agent 2", next_agent="agent1")
+    team = Swarm([agnet1, agent2])
+    result = await team.run("task", termination_condition=StopMessageTermination())
+    assert len(result.messages) == 5
+    assert result.messages[0].content == "task"
+    assert result.messages[1].content == "handoff to agent2"
+    assert result.messages[2].content == "Transferred to agent1."
+    assert result.messages[3].content == "Hello"
+    assert result.messages[4].content == "TERMINATE"
